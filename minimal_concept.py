@@ -11,6 +11,11 @@
 import torch, torch.nn as nn
 from transformers import CLIPConfig, CLIPModel, ViTConfig, ViTModel
 from contextlib import nullcontext
+import random
+torch.manual_seed(42)
+random.seed(42)
+import numpy as np
+np.random.seed(42)
 
 PAD_ID = 0  # token id used for <pad>
 
@@ -97,6 +102,9 @@ class TinyDecoder(nn.Module):
         self.decoder = nn.TransformerDecoder(dec_layer, num_layers=n_layers)
         self.lm_head = nn.Linear(dec_dim, vocab, bias=False)
         
+        # Tie output projection weights to token embedding
+        self.lm_head.weight = self.tok_emb.weight
+        
         # Pre-cache the causal mask at max size
         self.register_buffer(
             "causal_mask",
@@ -135,8 +143,17 @@ with torch.no_grad():
     img_feats = vision(pixels)                          # (B, ENC_DIM)
     print(f"Image features shape: {img_feats.shape}")
     
+    # loss helper
+    loss_fn = nn.CrossEntropyLoss(ignore_index=PAD_ID)
+    
     amp_ctx = torch.amp.autocast('cuda') if device == "cuda" else nullcontext()
     with amp_ctx:
         logits = model(img_feats, ids)
-    
-print("✅  Forward pass OK – logits shape:", logits.shape)
+        targets = ids          # synthetic labels
+        loss = loss_fn(logits.view(-1, logits.size(-1)), targets.view(-1))
+        print("Synthetic loss:", loss.item())
+
+    # ---- checkpoint demo ----
+    torch.save(model.state_dict(), "tiny_decoder.pt")
+    model.load_state_dict(torch.load("tiny_decoder.pt"))
+    print("✅  Forward pass OK – logits shape:", logits.shape, "(checkpoint round‑trip verified)")
