@@ -32,7 +32,8 @@ from transformers import CLIPTokenizer
 clip_tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-base-patch32")
 
 if clip_tokenizer.pad_token_id is None:
-    clip_tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
+    clip_tokenizer.add_tokens(["<|pad|>"])           # add as normal token
+    clip_tokenizer.pad_token = "<|pad|>"             # tell tokenizer to use it
 
 PAD_ID = clip_tokenizer.pad_token_id
 BOS_ID = clip_tokenizer.bos_token_id      # 49406  <|startoftext|>
@@ -121,9 +122,9 @@ vision, ENC_DIM = load_encoder("clip")   # swap to "vit" if you like
 print(f"Encoder hidden size = {ENC_DIM}")
 
 #%% [markdown]
-# ## Stage 2 – Load Flickr30k & Build a Caption DataLoader
+# ## Stage 2 – Load Flickr30k & Build a Caption DataLoader
 #
-# We fetch the HuggingFace parquet version of Flickr30k (≈ 31 k images).
+# We fetch the HuggingFace parquet version of Flickr30k (≈ 31 k images).
 # For the demo we load only 1 % of the training split to keep runtime light.
 # The collate function:
 # * preprocesses the image with CLIP's own resize + normalise;
@@ -287,7 +288,7 @@ def greedy_generate(model: TinyDecoder,
     return torch.tensor(generated, dtype=torch.long)
 
 #%% [markdown]
-# ## Stage 3 – Single Training Step Demo
+# ## Stage 3 – Single Training Step Demo
 #
 # We run one forward/backward pass to prove the whole pipeline works.
 # This is **not** a full training loop; replace it with epoch logic later.
