@@ -1,11 +1,13 @@
 #%% [markdown]
-# # Week‑4 Minimal Vision‑Language Merge 🪄🖼️→📝 (v1.1)
+# # Week‑4 Vision‑Language Captioning 🪄 CLIP → Tiny‑Decoder (v2)
 # 
-# **New in v1.1** – automatic projection so the encoder's hidden size (e.g. 768 for CLIP/ViT‑B) always matches the decoder's embedding dim. No more shape‑mismatch errors like `mat1 and mat2 shapes cannot be multiplied (2×768 vs 512×1024)`.
+# **What changed in v2**
+# 1. Loads **CLIPTokenizer** and extends it with a dedicated `<pad>` token.
+# 2. Uses that vocabulary (≈ 49 k) for the decoder.
+# 3. Adds a Flickr30k loader & collate function for caption fine‑tuning.
+# 4. Demonstrates a single mini‑batch forward + loss with the new data.
 # 
-# Run on CPU with synthetic inputs to confirm plumbing; swap the synthetic loader for Flickr30k when you're online.
-# 
-# ---
+# Run each stage top‑to‑bottom; cells are grouped logically with headings.
 
 #%%
 import torch, torch.nn as nn
@@ -17,7 +19,27 @@ random.seed(42)
 import numpy as np
 np.random.seed(42)
 
-PAD_ID = 0  # token id used for <pad>
+#%% [markdown]
+# ## Stage 1 – Tokenizer & Vocabulary (from CLIP)
+#
+# We re‑use the exact BPE vocabulary that CLIP's text tower was trained on.
+# A `<pad>` token is appended because the original model never needed one.
+# BOS and EOS are already present as special tokens in the pretrained config.
+#%%
+
+from transformers import CLIPTokenizer
+
+clip_tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-base-patch32")
+
+if clip_tokenizer.pad_token_id is None:
+    clip_tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
+
+PAD_ID = clip_tokenizer.pad_token_id
+BOS_ID = clip_tokenizer.bos_token_id      # 49406  <|startoftext|>
+EOS_ID = clip_tokenizer.eos_token_id      # 49407  <|endoftext|>
+
+print(f"Vocab size with PAD: {len(clip_tokenizer)}")
+print(f"Special IDs – PAD:{PAD_ID}, BOS:{BOS_ID}, EOS:{EOS_ID}")
 
 if torch.cuda.is_available():
     device = "cuda"
@@ -95,8 +117,86 @@ def load_encoder(which: str = "clip"):
     
     return vision_fwd, hidden
 
-vision, ENC_DIM = load_encoder("vit")   # swap to "vit" if you like
+vision, ENC_DIM = load_encoder("clip")   # swap to "vit" if you like
 print(f"Encoder hidden size = {ENC_DIM}")
+
+#%% [markdown]
+# ## Stage 2 – Load Flickr30k & Build a Caption DataLoader
+#
+# We fetch the HuggingFace parquet version of Flickr30k (≈ 31 k images).
+# For the demo we load only 1 % of the training split to keep runtime light.
+# The collate function:
+# * preprocesses the image with CLIP's own resize + normalise;
+# * builds `decoder_input_ids` (BOS+tokens) and `target_ids` (tokens+EOS);
+# * right‑pads to the batch max length with `PAD_ID`.
+#%%
+from datasets import load_dataset
+from torchvision import transforms
+from PIL import Image
+from torch.utils.data import DataLoader
+from torch.nn.utils.rnn import pad_sequence
+
+# CLIP image preprocessing
+preprocess_clip = transforms.Compose([
+    transforms.Resize(224, interpolation=Image.BICUBIC),
+    transforms.CenterCrop(224),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=(0.48145466, 0.4578275, 0.40821073),
+                         std=(0.26862954, 0.26130258, 0.27577711)),
+])
+
+dataset_full = load_dataset("nlphuji/flickr30k", split="test[:1%]")
+print("Loaded subset size:", len(dataset_full))
+
+def collate_caption(batch):
+    """Collate a batch of Flickr30k samples for CLIP captioning."""
+    image_tensors = []
+    decoder_inputs = []
+    label_targets = []
+
+    for item in batch:
+        # Use first caption; clip_tokenizer handles truncation
+        caption_tokens = clip_tokenizer(
+            item["caption"][0],
+            truncation=True,
+            max_length=64
+        ).input_ids
+
+        # Build BOS + caption  / target = caption + EOS
+        decoder_in  = [BOS_ID] + caption_tokens
+        target_out  = caption_tokens + [EOS_ID]
+
+        # The image is already a PIL image, just convert to RGB if needed
+        image = item["image"].convert("RGB") 
+        image_tensors.append(preprocess_clip(image))
+
+        decoder_inputs.append(torch.tensor(decoder_in, dtype=torch.long))
+        label_targets.append(torch.tensor(target_out, dtype=torch.long))
+
+    # Pad sequences
+    decoder_inputs_padded = pad_sequence(decoder_inputs,
+                                         batch_first=True,
+                                         padding_value=PAD_ID)
+    label_targets_padded  = pad_sequence(label_targets,
+                                         batch_first=True,
+                                         padding_value=PAD_ID)
+
+    return (
+        torch.stack(image_tensors),
+        decoder_inputs_padded,
+        label_targets_padded
+    )
+
+dataloader = DataLoader(
+    dataset_full,
+    batch_size=4,
+    shuffle=True,
+    collate_fn=collate_caption
+)
+images_batch, dec_inputs_batch, targets_batch = next(iter(dataloader))
+print("Batch shapes – images:", images_batch.shape,
+      "dec_in:", dec_inputs_batch.shape,
+      "targets:", targets_batch.shape)
 
 # ------------------------------------------------------------
 # 2.  Tiny decoder with automatic projection layer
@@ -168,8 +268,8 @@ class TinyDecoder(nn.Module):
 def greedy_generate(model: TinyDecoder,
                     vision_fn,
                     image: torch.Tensor,
-                    bos_token: int = 1,
-                    eos_token: int = 2,
+                    bos_token: int = BOS_ID,
+                    eos_token: int = EOS_ID,
                     max_len: int = 20) -> torch.LongTensor:
     """
     Run naive greedy decoding given a single image tensor on `device`.
@@ -186,48 +286,46 @@ def greedy_generate(model: TinyDecoder,
             break
     return torch.tensor(generated, dtype=torch.long)
 
-# ------------------------------------------------------------
-# 3.  Minimal end‑to‑end smoke test (synthetic)
-# ------------------------------------------------------------
-B = 2
-pixels = torch.randn(B, 3, 224, 224, device=device)
-ids    = torch.randint(0, 999, (B, 6), device=device)
+#%% [markdown]
+# ## Stage 3 – Single Training Step Demo
+#
+# We run one forward/backward pass to prove the whole pipeline works.
+# This is **not** a full training loop; replace it with epoch logic later.
+#%%
+model = TinyDecoder(enc_dim=ENC_DIM,
+                    dec_dim=512,
+                    vocab=len(clip_tokenizer)).to(device).eval()
 
-# Make sure we use the ACTUAL encoder dimension from the features
-model = TinyDecoder(enc_dim=ENC_DIM, dec_dim=512).to(device).eval()
+loss_fn = nn.CrossEntropyLoss(ignore_index=PAD_ID)
 
-with torch.no_grad():
-    img_feats = vision(pixels)                          # (B, ENC_DIM)
-    print(f"Image features shape: {img_feats.shape}")
-    
-    # loss helper
-    loss_fn = nn.CrossEntropyLoss(ignore_index=PAD_ID)
-    
-    # Use autocast only on CUDA; float16 math on MPS can silently break some ops
-    amp_ctx = torch.cuda.amp.autocast('cuda') if device == "cuda" else nullcontext()
-    
-    with amp_ctx:
-        logits = model(img_feats, ids)
-        targets = ids          # synthetic labels (placed here to avoid undefined var)
-        # ---- debug logging ----
-        print("logits dtype:", logits.dtype, "| min:", float(logits.min()), "max:", float(logits.max()), "mean:", float(logits.mean()))
-        print("logits abs-sum:", float(logits.abs().sum()))
-        # Compute loss both on-device and on CPU to spot backend quirks
-        logits_f32 = logits.float()
-        flat_logits = logits_f32.view(-1, logits_f32.size(-1))
-        flat_targets = targets.view(-1)
+model.train()
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 
-        loss_device = loss_fn(flat_logits, flat_targets)
-        loss_cpu    = loss_fn(flat_logits.cpu(), flat_targets.cpu())
+images_batch = images_batch.to(device)
+dec_inputs_batch = dec_inputs_batch.to(device)
+targets_batch = targets_batch.to(device)
 
-        print("Device loss :", float(loss_device))
-        print("CPU loss    :", float(loss_cpu))
+encoder_features = vision(images_batch)
+logits_train = model(encoder_features, dec_inputs_batch)
 
-    # ---- checkpoint demo ----
-    torch.save(model.state_dict(), "tiny_decoder.pt")
-    model.load_state_dict(torch.load("tiny_decoder.pt"))
-    print("✅  Forward pass OK – logits shape:", logits.shape, "(checkpoint round‑trip verified)")
+flat_logits   = logits_train.view(-1, logits_train.size(-1))
+flat_targets  = targets_batch.view(-1)
 
-# quick generation sanity‑check
-sample_tokens = greedy_generate(model, vision, pixels[0])
-print("Greedy tokens:", sample_tokens.tolist())
+train_loss = loss_fn(flat_logits, flat_targets)
+train_loss.backward()
+optimizer.step()
+optimizer.zero_grad()
+
+print("One-step training loss:", float(train_loss))
+model.eval()
+
+# ---- checkpoint demo ----
+torch.save(model.state_dict(), "tiny_decoder.pt")
+model.load_state_dict(torch.load("tiny_decoder.pt"))
+print("✅  Forward pass OK – logits shape:", logits_train.shape, "(checkpoint round‑trip verified)")
+
+# Greedy caption demo
+generated_ids = greedy_generate(model, vision, images_batch[0])
+caption_text  = clip_tokenizer.decode(generated_ids.tolist(),
+                                      skip_special_tokens=True)
+print("Greedy caption:", caption_text)
