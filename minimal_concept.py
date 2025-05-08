@@ -31,11 +31,16 @@ from transformers import CLIPTokenizer
 
 clip_tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-base-patch32")
 
-if clip_tokenizer.pad_token_id is None:
-    clip_tokenizer.add_tokens(["<|pad|>"])           # add as normal token
-    clip_tokenizer.pad_token = "<|pad|>"             # tell tokenizer to use it
-
+# ------------------------------------------------------------------
+# Ensure PAD token has its **own** unique ID (not shared with EOS)
+# ------------------------------------------------------------------
+if clip_tokenizer.pad_token_id is None or clip_tokenizer.pad_token_id == clip_tokenizer.eos_token_id:
+    # Pick a pad token string that is guaranteed not to exist
+    pad_token_str = "<|pad_extra|>"
+    clip_tokenizer.add_tokens([pad_token_str])         # append to vocab
+    clip_tokenizer.pad_token = pad_token_str           # register as pad
 PAD_ID = clip_tokenizer.pad_token_id
+
 BOS_ID = clip_tokenizer.bos_token_id      # 49406  <|startoftext|>
 EOS_ID = clip_tokenizer.eos_token_id      # 49407  <|endoftext|>
 
