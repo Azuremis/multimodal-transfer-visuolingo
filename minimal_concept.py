@@ -166,7 +166,11 @@ print("Batch shapes – images:", images_batch.shape,
 # ------------------------------------------------------------
 class TinyDecoder(nn.Module):
     """
-    A minimal prefix-LM decoder: attends to ViT patch embeddings, autoregressively generates text.
+    A standard encoder-decoder architecture: 
+    - Patch embeddings from image encoder are used as memory
+    - Caption tokens are used as decoder targets
+    - Follows the traditional Transformer decoder design
+    
     Args:
         enc_dim: Patch embedding dim (should match PATCH_DIM).
         dec_dim: Decoder d_model.
@@ -174,24 +178,37 @@ class TinyDecoder(nn.Module):
         n_layers / n_heads: Transformer depth & width.
         max_len: Max sequence length (controls positional embedding & mask).
     """
-    def __init__(self, enc_dim=PATCH_DIM, dec_dim=768, vocab=1000,
-                 n_layers=1, n_heads=8, max_len=256):
+    def __init__(self, enc_dim=PATCH_DIM, dec_dim=512, vocab=1000,
+                 n_layers=1, n_heads=8, max_len=128):
         super().__init__()
         assert dec_dim % n_heads == 0, "n_heads must divide d_model"
-        self.proj = (nn.Identity() if enc_dim == dec_dim else nn.Linear(enc_dim, dec_dim, bias=False))
+        
+        # Projection for patch embeddings (encoder output → decoder input)
+        self.memory_proj = nn.Linear(enc_dim, dec_dim, bias=False) if enc_dim != dec_dim else nn.Identity()
+        
+        # Token embeddings
         self.tok_emb = nn.Embedding(vocab, dec_dim)
         with torch.no_grad():
             self.tok_emb.weight[: clip_text_emb.size(0)].copy_(clip_text_emb)
-            self.tok_emb.weight[PAD_ID].zero_()          # neutralise PAD vector
+            self.tok_emb.weight[PAD_ID].zero_()  # neutralise PAD vector
         for p in self.tok_emb.parameters():
-            p.requires_grad = False                      # keep everything frozen
-        self.pos_emb = nn.Parameter(torch.randn(1, max_len, dec_dim))
+            p.requires_grad = False              # keep embeddings frozen
+            
+        # Position embeddings - separate for memory and target
+        self.mem_pos_emb = nn.Parameter(torch.randn(1, max_len, dec_dim))  # for patches 
+        self.tgt_pos_emb = nn.Parameter(torch.randn(1, max_len, dec_dim))  # for text
+        
+        # Transformer decoder
         dec_layer = nn.TransformerDecoderLayer(d_model=dec_dim, nhead=n_heads, batch_first=True)
         if hasattr(dec_layer, "_set_gradient_checkpointing"):
             dec_layer._set_gradient_checkpointing(True)
         self.decoder = nn.TransformerDecoder(dec_layer, num_layers=n_layers)
+        
+        # Output projection (tied with token embeddings)
         self.lm_head = nn.Linear(dec_dim, vocab, bias=False)
         self.lm_head.weight = self.tok_emb.weight
+        
+        # Standard causal mask for autoregressive decoding
         self.register_buffer(
             "causal_mask",
             torch.ones(max_len, max_len, dtype=torch.bool).triu(1)
@@ -199,31 +216,38 @@ class TinyDecoder(nn.Module):
 
     def forward(self, patch_emb: torch.Tensor, caption_ids: torch.LongTensor) -> torch.Tensor:
         """
+        Standard encoder-decoder forward pass.
         Args:
-            patch_emb: (B, P, D) frozen prefix from ViT.
-            caption_ids: (B, L) caption token IDs (BOS + words + PAD)
+            patch_emb: (B, P, D) frozen patch embeddings from ViT (memory)
+            caption_ids: (B, L) caption token IDs (target)
         Returns:
-            logits (B, P+L, vocab)
+            logits (B, L, vocab) - one distribution per caption position
         """
         B, P, _ = patch_emb.shape
         L = caption_ids.size(1)
 
-        patch_emb = self.proj(patch_emb)  # Project patches from 768→512
-        text_emb = self.tok_emb(caption_ids)
-        seq = torch.cat([patch_emb, text_emb], dim=1)          # (B, P+L, D)
-        seq = seq + self.pos_emb[:, :P+L]
-
-        # causal mask
-        mask = self.causal_mask[:P+L, :P+L].clone()
-        mask[:P, :] = False                                    # patches are visible
-
-        pad_mask = torch.zeros(B, P+L, dtype=torch.bool, device=seq.device)
-        pad_mask[:, P:] = (caption_ids == PAD_ID)
-
-        out = self.decoder(seq, seq,
-                           tgt_mask=mask,
-                           tgt_key_padding_mask=pad_mask)
-        return self.lm_head(out)
+        # Prepare memory (encoder output)
+        memory = self.memory_proj(patch_emb)  # Project patches to decoder dim
+        memory = memory + self.mem_pos_emb[:, :P]  # Add positional embeddings
+        
+        # Prepare target (decoder input)
+        tgt = self.tok_emb(caption_ids)  # Token embeddings
+        tgt = tgt + self.tgt_pos_emb[:, :L]  # Add positional embeddings
+        
+        # Prepare masks
+        tgt_mask = self.causal_mask[:L, :L]  # Standard causal mask for text-only
+        padding_mask = (caption_ids == PAD_ID)  # (B, L) mask for padding in caption
+        
+        # Transformer decoder
+        out = self.decoder(
+            tgt=tgt,                        # Caption tokens only
+            memory=memory,                  # Patch embeddings only
+            tgt_mask=tgt_mask,              # Causal mask for autoregressive generation
+            tgt_key_padding_mask=padding_mask  # Mask padding tokens
+        )
+        
+        # Project to vocabulary
+        return self.lm_head(out)  # (B, L, vocab)
 
 # ------------------------------------------------------------
 # 2b.  Greedy generation helper
@@ -241,18 +265,26 @@ def greedy_generate(model: TinyDecoder,
     Returns a 1‑D tensor of generated token IDs (including EOS).
     """
     print(f"[GENERATE] Starting greedy generation (max_len={max_len})")
+    
+    # Encode image once - memory stays fixed during generation
     patch_seq = vision_fn(image.to(device).unsqueeze(0))
     print(f"[GENERATE] Extracted patch sequence: {patch_seq.shape}")
     
+    # Start with BOS token
     generated = [bos_token]
     print(f"[GENERATE] Starting with BOS token: {bos_token}")
     
     for step in range(max_len):
-        inp = torch.tensor(generated, device=patch_seq.device).unsqueeze(0)
-        logits = model(patch_seq, inp)
+        # Convert generated sequence to tensor
+        tgt = torch.tensor(generated, device=patch_seq.device).unsqueeze(0)
+        
+        # Get predictions
+        logits = model(patch_seq, tgt)
         print(f"[GENERATE] Step {step+1}: logits shape {logits.shape}")
         
+        # Get next token prediction (last position only)
         next_token_logits = logits[0, -1]
+        
         # Print top token probabilities for monitoring
         probs = next_token_logits.softmax(-1)
         values, indices = probs.topk(5)
@@ -260,11 +292,15 @@ def greedy_generate(model: TinyDecoder,
         if print_probs or step < 3:  # Print for first few steps regardless
             print(f"[GENERATE] Top 5 tokens for step {step+1}: {list(zip(top5_tokens, values.tolist()))}")
         
+        # Select next token (greedy)
         next_id = int(next_token_logits.argmax())
         token_text = clip_tokenizer.decode([next_id])
         print(f"[GENERATE] Selected token: '{token_text}' (ID: {next_id})")
         
+        # Add to generated sequence
         generated.append(next_id)
+        
+        # Stop if EOS token is generated
         if next_id == eos_token:
             print(f"[GENERATE] EOS token generated, stopping at length {len(generated)}")
             break
@@ -360,13 +396,15 @@ print("Tokenizer decode :", clip_tokenizer.decode(
 # We train for `NUM_EPOCHS` and log train / val loss each epoch.  
 # No fancy schedulers yet – keep the loop minimal.
 #%%
-model = TinyDecoder(enc_dim=768,  # Patch embedding dim is 768
-                    dec_dim=512,  # Text embedding dim is 512
-                    n_layers=3,
-                    n_heads=8,
-                    vocab=len(clip_tokenizer)).to(device)
+model = TinyDecoder(
+    enc_dim=768,       # CLIP/ViT patch embedding dimension
+    dec_dim=512,       # Hidden size from CLIP text model
+    n_layers=3,        # Keep the same complexity
+    n_heads=8,         # 8 heads for 512-dim gives 64 dim per head
+    vocab=len(clip_tokenizer)
+).to(device)
 
-loss_fn   = nn.CrossEntropyLoss(ignore_index=PAD_ID)
+loss_fn = nn.CrossEntropyLoss(ignore_index=-100)  # Ignore padding
 optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
 
 def run_epoch(loader, train: bool):
@@ -381,53 +419,32 @@ def run_epoch(loader, train: bool):
                                  targets.to(device))
         print(f"[EPOCH] Batch {steps+1}: images {images.shape}, dec_in {dec_in.shape}, targets {targets.shape}")
         
+        # Get patches from vision encoder
         patch_seq = get_patch_sequence(images)
         print(f"[EPOCH] Patch sequence shape: {patch_seq.shape}")
         
         with torch.set_grad_enabled(train):
-            logits = model(patch_seq, dec_in)
+            # Get predictions - using standard encoder-decoder architecture
+            logits = model(patch_seq, dec_in)  # (B, L, vocab)
             print(f"[EPOCH] Model output logits shape: {logits.shape}")
 
-            # ------------------------------------------------------------
-            # Build labels:                         patch prefix  | caption
-            # labels_full shape  (B, P + L)
-            #   * -100 for every patch position
-            #   * -100 for PAD tokens
-            #   * target token t  sits at  BOS+t   (shift-right)
-            # ------------------------------------------------------------
-            B, P, _ = patch_seq.shape
-            L = dec_in.size(1)                       # caption length incl. BOS
-            print(f"[EPOCH] Dimensions: B={B}, P={P}, L={L}")
+            # Create target tensor for loss calculation 
+            # We need to predict the next token at each position
+            shifted_targets = targets.clone()
+            shifted_targets[shifted_targets == PAD_ID] = -100  # Ignore padding tokens
             
-            # Build full labels tensor with P (patches) + L (text tokens) 
-            labels_full = torch.full((B, P + L), -100, device=device)
-
-            # Shift target tokens by +1 (so first token is predicted after BOS)
-            max_tgt_len = min(L-1, targets.size(1))  # Ensure we don't exceed label tensor size
-            non_pad = (targets[:, :max_tgt_len] != PAD_ID)
-            labels_full[:, P+1:P+1+max_tgt_len][non_pad] = targets[:, :max_tgt_len][non_pad]
-            
-            # optional sanity print on first batch
+            # Print debug info
             if steps == 0:
-                print("[EPOCH] Label check (patch-1…BOS…w1):",
-                    labels_full[0, P-1:P+4].tolist())
-                # Print some actual token values
-                for i in range(min(3, B)):
-                    # print(f"[EPOCH] Input sample {i+1}:")
-                    dec_text = clip_tokenizer.decode(dec_in[i].tolist(), skip_special_tokens=False)
-                    target_text = clip_tokenizer.decode(targets[i].tolist(), skip_special_tokens=False)
-                    # print(f"  Input IDs: {dec_in[i, :min(10, L)].tolist()}")
-                    # print(f"  Target IDs: {targets[i, :min(10, L)].tolist()}")
-                    # print(f"  Input text: '{dec_text}'")
-                    # print(f"  Target text: '{target_text}'")
+                print(f"[EPOCH] Input IDs shape: {dec_in.shape}, Target IDs shape: {shifted_targets.shape}")
+                print(f"[EPOCH] First sample input: {dec_in[0, :5].tolist()}")
+                print(f"[EPOCH] First sample target: {shifted_targets[0, :5].tolist()}")
             
-            # Check shapes before loss computation
-            print(f"[EPOCH] Logits shape for loss: {logits.reshape(-1, logits.size(-1)).shape}")
-            print(f"[EPOCH] Labels shape for loss: {labels_full.view(-1).shape}")
-            
+            # Compute loss directly on sequence - no need for complex shifting
             try:
-                loss = loss_fn(logits.reshape(-1, logits.size(-1)),
-                             labels_full.view(-1))
+                loss = loss_fn(
+                    logits.reshape(-1, logits.size(-1)),  # (B*L, vocab)
+                    shifted_targets.reshape(-1)           # (B*L)
+                )
                 print(f"[EPOCH] Computed loss: {loss.item():.4f}")
             except Exception as e:
                 print(f"[EPOCH] ERROR computing loss: {e}")
