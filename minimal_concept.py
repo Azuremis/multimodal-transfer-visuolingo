@@ -232,16 +232,25 @@ def greedy_generate(model: TinyDecoder,
                     image: torch.Tensor,
                     bos_token: int = BOS_ID,
                     eos_token: int = EOS_ID,
-                    max_len: int = 20) -> torch.LongTensor:
+                    max_len: int = 20,
+                    print_probs: bool = False) -> torch.LongTensor:
     """
     Run naive greedy decoding given a single image tensor on `device`.
     Returns a 1‑D tensor of generated token IDs (including EOS).
     """
     patch_seq = vision_fn(image.to(device).unsqueeze(0))
     generated = [bos_token]
-    for _ in range(max_len):
+    for step in range(max_len):
         inp = torch.tensor(generated, device=patch_seq.device).unsqueeze(0)
         logits = model(patch_seq, inp)
+        
+        # Print top token probabilities for debugging
+        if print_probs and step == 0:  # Print for first step
+            probs = logits.softmax(-1)[0, -1]
+            values, indices = probs.topk(5)
+            top5_tokens = [clip_tokenizer.decode([idx.item()]) for idx in indices]
+            print("Top 5 first tokens:", list(zip(top5_tokens, values.tolist())))
+        
         next_id = int(logits[0, -1].argmax())
         generated.append(next_id)
         if next_id == eos_token:
@@ -257,18 +266,35 @@ bleu_metric = evaluate.load("bleu")
 def compute_bleu(model, vision_fn, dataloader, max_batches: int = 25):
     """
     Compute corpus BLEU-4 on the dataloader (truncated to max_batches for speed).
+    Processes all images in each batch for more robust evaluation.
     """
     model.eval()
     preds, refs = [], []
     for b, (imgs, _, labels) in enumerate(dataloader):
         if b >= max_batches: break
         imgs = imgs.to(device)
-        ids  = greedy_generate(model, get_patch_sequence, imgs[0])
-        preds.append(clip_tokenizer.decode(ids.tolist(), skip_special_tokens=True))
-        ref_txt = clip_tokenizer.decode(labels[0].tolist(), skip_special_tokens=True)
-        refs.append([ref_txt])
-    score = bleu_metric.compute(predictions=preds, references=refs)["bleu"]
-    return score
+        # Process all images in the batch, not just the first one
+        for i in range(imgs.size(0)):
+            ids = greedy_generate(model, vision_fn, imgs[i])
+            decoded_text = clip_tokenizer.decode(ids.tolist(), skip_special_tokens=True)
+            # Ensure we don't add empty predictions
+            if not decoded_text.strip():
+                decoded_text = "empty"  # Add fallback text to prevent division by zero
+            preds.append(decoded_text)
+            ref_txt = clip_tokenizer.decode(labels[i].tolist(), skip_special_tokens=True)
+            refs.append([ref_txt])
+    
+    # Check if we have any non-empty predictions
+    if not preds or all(p == "empty" for p in preds):
+        print("Warning: All predictions are empty! BLEU would be 0.")
+        return 0.0
+        
+    try:
+        score = bleu_metric.compute(predictions=preds, references=refs)["bleu"]
+        return score
+    except Exception as e:
+        print(f"BLEU calculation error: {e}")
+        return 0.0
 
 #%% [markdown]
 # ## Stage 3 – Mini Train / Validation / Test Splits
@@ -282,13 +308,13 @@ def compute_bleu(model, vision_fn, dataloader, max_batches: int = 25):
 # to enlarge once the loop is stable.
 #%%
 
-SUBSET_TRAIN = "test[:5%]"     # First 20% for training
-SUBSET_VAL   = "test[5%:6%]"   # Next 2% for validation
-SUBSET_TEST  = "test[6%:7%]"   # Next 2% for testing
+SUBSET_TRAIN = "test[:20%]"   # Increase to 20% for better training
+SUBSET_VAL   = "test[20%:22%]" # Move validation set accordingly
+SUBSET_TEST  = "test[22%:24%]" # Move test set accordingly
 
-NUM_EPOCHS  = 3
+NUM_EPOCHS = 10  # Increase from 3 to 10
 BATCH_SIZE  = 4
-LR          = 3e-4
+LR          = 1e-4
 
 train_set = load_dataset("nlphuji/flickr30k", split=SUBSET_TRAIN)
 val_set   = load_dataset("nlphuji/flickr30k", split=SUBSET_VAL)
@@ -374,7 +400,6 @@ for epoch in range(1, NUM_EPOCHS + 1):
 #%%
 model.eval()
 images_test, _, _ = next(iter(test_loader))
-sample_caption_ids = greedy_generate(model, get_patch_sequence, images_test[0])
+sample_caption_ids = greedy_generate(model, get_patch_sequence, images_test[0], print_probs=True)
 print("Generated IDs:", sample_caption_ids.tolist())
-print("→", clip_tokenizer.decode(sample_caption_ids.tolist(),
-                                 skip_special_tokens=True))
+print("→", clip_tokenizer.decode(sample_caption_ids.tolist(), skip_special_tokens=True))
