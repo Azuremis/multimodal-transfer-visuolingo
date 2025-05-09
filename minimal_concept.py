@@ -1,13 +1,17 @@
 #%% [markdown]
-# # Week‑4 Vision‑Language Captioning 🪄 CLIP → Tiny‑Decoder (v2)
-# 
-# **What changed in v2**
-# 1. Loads **CLIPTokenizer** and extends it with a dedicated `<pad>` token.
-# 2. Uses that vocabulary (≈ 49 k) for the decoder.
-# 3. Adds a Flickr30k loader & collate function for caption fine‑tuning.
-# 4. Demonstrates a single mini‑batch forward + loss with the new data.
-# 
-# Run each stage top‑to‑bottom; cells are grouped logically with headings.
+# # Week‑4 Prefix‑LM Captioning 🪄 CLIP Patches → Tiny Decoder (v3)
+#
+# **v3 key ideas**
+# * Use **all CLIP ViT patch embeddings** as a *frozen prefix*.
+# * Re‑use CLIP's **frozen token‑embedding matrix** for the decoder.
+# * One single Transformer stream:  
+#   `[patch₀ … patchₙ] BOS  caption_tokens … EOS  PAD …`
+# * Decoder predicts *only* the caption tokens; patches are context.
+#
+# Check console logs for:
+# * patch count `P`, caption length `L_max`
+# * loss dropping from ≈ 20 → single digits
+# * validation BLEU increasing each epoch
 
 #%%
 import torch, torch.nn as nn
@@ -59,48 +63,24 @@ elif torch.backends.mps.is_available():
 else:
     device = "cpu"
 
-# ------------------------------------------------------------
-# 1.  CLIP Vision Encoder Loader (falls back to random weights offline)
-# ------------------------------------------------------------
+# --- Load full CLIP (vision + text) once ---
+clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device).eval()
+for p in clip_model.parameters():
+    p.requires_grad = False
 
-def load_clip_encoder():
+vision = clip_model.vision_model  
+clip_text_emb = clip_model.text_model.embeddings.token_embedding.weight  # (49408,512)
+PATCH_DIM = clip_text_emb.size(1)   
+# ------------------------------------------------------------
+# Helper to fetch patch sequence from CLIP ViT
+# ------------------------------------------------------------
+def get_patch_sequence(pixel_values: torch.Tensor) -> torch.Tensor:
     """
-    Load a frozen CLIP vision encoder.
-    
-    Returns:
-        vision_fwd: Function that maps pixel tensor -> pooled features.
-        hidden_dim: Output feature dimension of the encoder.
+    Returns (B, P, 512) patch embeddings from CLIP ViT.
+    P ≈ 50 for 224×224 images.
     """
-    try:
-        enc = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
-        enc.to(device).eval()
-        for p in enc.parameters():
-            p.requires_grad = False
-    except Exception:
-        print("⚠️  Offline – using random CLIP weights")
-        enc = CLIPModel(CLIPConfig()).to(device).eval()
-        for p in enc.parameters():
-            p.requires_grad = False
-    
-    # Get the vision encoder's hidden dimension
-    if hasattr(enc.config, "vision_embed_dim"):
-        hidden_dim = enc.config.vision_embed_dim
-    elif hasattr(enc.config, "vision_config"):
-        hidden_dim = enc.config.vision_config.hidden_size
-    else:
-        print("Warning: Unable to determine CLIP hidden size from config")
-        # Perform a forward pass to get the dimension
-        with torch.no_grad():
-            sample_out = enc.get_image_features(pixel_values=torch.randn(1, 3, 224, 224, device=device))
-            hidden_dim = sample_out.shape[-1]
-    
-    def vision_fwd(pixel_values):
-        return enc.get_image_features(pixel_values=pixel_values)
-    
-    print(f"CLIP vision encoder dimension: {hidden_dim}")
-    return vision_fwd, hidden_dim
-
-vision, ENC_DIM = load_clip_encoder()
+    with torch.no_grad():
+        return vision(pixel_values).last_hidden_state
 
 #%% [markdown]
 # ## Stage 2 – Load Flickr30k & Build a Caption DataLoader
@@ -185,65 +165,63 @@ print("Batch shapes – images:", images_batch.shape,
 # ------------------------------------------------------------
 class TinyDecoder(nn.Module):
     """
-    A minimal cross‑attention decoder that turns an image embedding into
-    an autoregressive text sequence.
-
+    A minimal prefix-LM decoder: attends to ViT patch embeddings, autoregressively generates text.
     Args:
-        enc_dim: Dimension of the encoder CLS/vector.
-        dec_dim: Model d_model for the text decoder.
-        vocab:   Vocabulary size including special tokens.
+        enc_dim: Patch embedding dim (should match PATCH_DIM).
+        dec_dim: Decoder d_model.
+        vocab:   Vocabulary size.
         n_layers / n_heads: Transformer depth & width.
         max_len: Max sequence length (controls positional embedding & mask).
     """
-    def __init__(self, enc_dim, dec_dim=512, vocab=1000, n_layers=1, n_heads=8, max_len=128):
+    def __init__(self, enc_dim=PATCH_DIM, dec_dim=768, vocab=1000,
+                 n_layers=1, n_heads=8, max_len=256):
         super().__init__()
         assert dec_dim % n_heads == 0, "n_heads must divide d_model"
         self.proj = (nn.Identity() if enc_dim == dec_dim else nn.Linear(enc_dim, dec_dim, bias=False))
         self.tok_emb = nn.Embedding(vocab, dec_dim)
-        # Initialise embeddings with a smaller std so early loss isn't gigantic
-        nn.init.normal_(self.tok_emb.weight, mean=0.0, std=0.02)
+        with torch.no_grad():
+            self.tok_emb.weight[: clip_text_emb.size(0)].copy_(clip_text_emb)
+        for p in self.tok_emb.parameters():
+            p.requires_grad = False
         self.pos_emb = nn.Parameter(torch.randn(1, max_len, dec_dim))
         dec_layer = nn.TransformerDecoderLayer(d_model=dec_dim, nhead=n_heads, batch_first=True)
-        # Enable gradient checkpointing to save memory (PyTorch ≥ 2.3)
         if hasattr(dec_layer, "_set_gradient_checkpointing"):
             dec_layer._set_gradient_checkpointing(True)
         self.decoder = nn.TransformerDecoder(dec_layer, num_layers=n_layers)
         self.lm_head = nn.Linear(dec_dim, vocab, bias=False)
-        
-        # Tie output projection weights to token embedding
         self.lm_head.weight = self.tok_emb.weight
-        
-        # Pre-cache the causal mask at max size
         self.register_buffer(
             "causal_mask",
             torch.ones(max_len, max_len, dtype=torch.bool).triu(1)
         )
 
-    def forward(self, img_emb: torch.Tensor, tgt_ids: torch.LongTensor) -> torch.Tensor:
-        """Run one full decoder pass.
-
-        Args:
-            img_emb: (B, D_enc) pooled image embeddings.
-            tgt_ids: (B, L) token ids including <bos> and possibly <pad>.
-
-        Returns:
-            Logits of shape (B, L, vocab).
+    def forward(self, patch_emb: torch.Tensor, caption_ids: torch.LongTensor) -> torch.Tensor:
         """
-        B, L = tgt_ids.shape
-        assert L <= self.pos_emb.size(1), "Sequence length exceeds max_len"
-        img = self.proj(img_emb).unsqueeze(1)           # (B,1,D_dec)
-        tgt = self.tok_emb(tgt_ids) + self.pos_emb[:, :L]
-        
-        # Use the pre-cached mask, sliced to the current sequence length
-        mask = self.causal_mask[:L, :L]
-        # padding mask: True where tgt_ids is PAD_ID
-        pad_mask = (tgt_ids == PAD_ID)
-        out = self.decoder(
-            tgt, img,
-            tgt_mask=mask,
-            tgt_key_padding_mask=pad_mask            # prevents attention to <pad>
-        )
-        return self.lm_head(out)                         # (B,L,V)
+        Args:
+            patch_emb: (B, P, D) frozen prefix from ViT.
+            caption_ids: (B, L) caption token IDs (BOS + words + PAD)
+        Returns:
+            logits (B, P+L, vocab)
+        """
+        B, P, _ = patch_emb.shape
+        L = caption_ids.size(1)
+
+        patch_emb = self.proj(patch_emb)  # Project patches from 768→512
+        text_emb = self.tok_emb(caption_ids)
+        seq = torch.cat([patch_emb, text_emb], dim=1)          # (B, P+L, D)
+        seq = seq + self.pos_emb[:, :P+L]
+
+        # causal mask
+        mask = self.causal_mask[:P+L, :P+L].clone()
+        mask[:P, :] = False                                    # patches are visible
+
+        pad_mask = torch.zeros(B, P+L, dtype=torch.bool, device=seq.device)
+        pad_mask[:, P:] = (caption_ids == PAD_ID)
+
+        out = self.decoder(seq, seq,
+                           tgt_mask=mask,
+                           tgt_key_padding_mask=pad_mask)
+        return self.lm_head(out)
 
 # ------------------------------------------------------------
 # 2b.  Greedy generation helper
@@ -259,11 +237,11 @@ def greedy_generate(model: TinyDecoder,
     Run naive greedy decoding given a single image tensor on `device`.
     Returns a 1‑D tensor of generated token IDs (including EOS).
     """
-    img_feat = vision_fn(image.to(device).unsqueeze(0))   # (1, D)
+    patch_seq = vision_fn(image.to(device).unsqueeze(0))
     generated = [bos_token]
     for _ in range(max_len):
-        inp = torch.tensor(generated, device=device).unsqueeze(0)  # (1, t)
-        logits = model(img_feat, inp)                              # (1,t,V)
+        inp = torch.tensor(generated, device=patch_seq.device).unsqueeze(0)
+        logits = model(patch_seq, inp)
         next_id = int(logits[0, -1].argmax())
         generated.append(next_id)
         if next_id == eos_token:
@@ -285,7 +263,7 @@ def compute_bleu(model, vision_fn, dataloader, max_batches: int = 25):
     for b, (imgs, _, labels) in enumerate(dataloader):
         if b >= max_batches: break
         imgs = imgs.to(device)
-        ids  = greedy_generate(model, vision_fn, imgs[0])
+        ids  = greedy_generate(model, get_patch_sequence, imgs[0])
         preds.append(clip_tokenizer.decode(ids.tolist(), skip_special_tokens=True))
         ref_txt = clip_tokenizer.decode(labels[0].tolist(), skip_special_tokens=True)
         refs.append([ref_txt])
@@ -296,9 +274,9 @@ def compute_bleu(model, vision_fn, dataloader, max_batches: int = 25):
 # ## Stage 3 – Mini Train / Validation / Test Splits
 #
 # To keep development light on an M‑series laptop, we sample tiny subsets:
-# * **Train**  5 % of Flickr30k train split  
-# * **Val**   1 % of Flickr30k validation split  
-# * **Test**   1 % of Flickr30k test split  
+# * **Train** 5 % of Flickr30k train split  
+# * **Val** 1 % of Flickr30k validation split  
+# * **Test**  1 % of Flickr30k test split  
 #
 # Use `NUM_EPOCHS = 2` and `BATCH_SIZE = 4` for a quick sanity‑run. Feel free
 # to enlarge once the loop is stable.
@@ -308,7 +286,7 @@ SUBSET_TRAIN = "test[:5%]"     # First 20% for training
 SUBSET_VAL   = "test[5%:6%]"   # Next 2% for validation
 SUBSET_TEST  = "test[6%:7%]"   # Next 2% for testing
 
-NUM_EPOCHS  = 1
+NUM_EPOCHS  = 3
 BATCH_SIZE  = 4
 LR          = 3e-4
 
@@ -341,18 +319,10 @@ print("Tokenizer decode :", clip_tokenizer.decode(
 # We train for `NUM_EPOCHS` and log train / val loss each epoch.  
 # No fancy schedulers yet – keep the loop minimal.
 #%%
-with torch.no_grad():
-    sample_images = next(iter(train_loader))[0].to(device)
-    sample_features = vision(sample_images)
-    actual_dim = sample_features.shape[-1]
-    print(f"Verifying feature dimensions - config says: {ENC_DIM}, actual: {actual_dim}")
-    # Use the actual dimension for the decoder
-    enc_dim_to_use = actual_dim
-
-model = TinyDecoder(enc_dim=enc_dim_to_use,
-                    dec_dim=768,  # Increased from 512 to match recommendation
-                    n_layers=3,   # Increased from 1 for better capacity
-                    n_heads=12,   # Increased from 8 for better attention
+model = TinyDecoder(enc_dim=768,  # Patch embedding dim is 768
+                    dec_dim=512,  # Text embedding dim is 512
+                    n_layers=3,
+                    n_heads=8,
                     vocab=len(clip_tokenizer)).to(device)
 
 loss_fn   = nn.CrossEntropyLoss(ignore_index=PAD_ID)
@@ -366,13 +336,18 @@ def run_epoch(loader, train: bool):
         images, dec_in, targets = (images.to(device),
                                    dec_in.to(device),
                                    targets.to(device))
+        patch_seq = get_patch_sequence(images)                 # (B,P,512)
         with torch.set_grad_enabled(train):
-            img_feat = vision(images)
             if steps == 0:
-                print(f"Image features shape: {img_feat.shape}, Expected: {ENC_DIM}")
-            logits   = model(img_feat, dec_in)
+                print(f"Patch seq shape: {patch_seq.shape}")
+            logits   = model(patch_seq, dec_in)
+
+            B, P, _ = patch_seq.shape
+            labels_full = torch.full((B, P + dec_in.size(1)),
+                                     -100, device=device)
+            labels_full[:, P:] = targets
             loss     = loss_fn(logits.view(-1, logits.size(-1)),
-                               targets.view(-1))
+                               labels_full.view(-1))
             if train:
                 loss.backward()
                 optimizer.step()
@@ -386,8 +361,9 @@ best_bleu = 0.0
 for epoch in range(1, NUM_EPOCHS + 1):
     train_loss = run_epoch(train_loader, train=True)
     val_loss   = run_epoch(val_loader,   train=False)
-    bleu_val = compute_bleu(model, vision, val_loader)
+    bleu_val = compute_bleu(model, get_patch_sequence, val_loader)
     print(f"Epoch {epoch}/{NUM_EPOCHS} | train {train_loss:.2f} | val {val_loss:.2f} | BLEU {bleu_val:.3f}")
+    print(f"... BLEU {bleu_val:.3f} | best {best_bleu:.3f}")
     if bleu_val >= best_bleu:
         best_bleu = bleu_val
         torch.save(model.state_dict(), "tiny_decoder_best.pt")
@@ -398,7 +374,7 @@ for epoch in range(1, NUM_EPOCHS + 1):
 #%%
 model.eval()
 images_test, _, _ = next(iter(test_loader))
-sample_caption_ids = greedy_generate(model, vision, images_test[0])
+sample_caption_ids = greedy_generate(model, get_patch_sequence, images_test[0])
 print("Generated IDs:", sample_caption_ids.tolist())
 print("→", clip_tokenizer.decode(sample_caption_ids.tolist(),
                                  skip_special_tokens=True))
