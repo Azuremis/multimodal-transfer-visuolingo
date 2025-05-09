@@ -325,6 +325,16 @@ test_loader  = DataLoader(test_set,  batch_size=BATCH_SIZE,
 
 print(f"Train {len(train_set)} | Val {len(val_set)} | Test {len(test_set)}")
 
+# Display a sample caption from the training set
+raw_caption = train_set[0]["caption"][0]
+print("Raw Flickr caption:", raw_caption)
+
+# Get a batch to see tokenized version
+sample_batch = next(iter(train_loader))
+dec_inputs_batch = sample_batch[1]
+print("Tokenizer decode :", clip_tokenizer.decode(
+         dec_inputs_batch[0].tolist(), skip_special_tokens=True))
+
 #%% [markdown]
 # ## Stage 4 – Tiny Training Loop
 #
