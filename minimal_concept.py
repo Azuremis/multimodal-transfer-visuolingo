@@ -11,7 +11,7 @@
 
 #%%
 import torch, torch.nn as nn
-from transformers import CLIPConfig, CLIPModel, ViTConfig, ViTModel
+from transformers import CLIPConfig, CLIPModel
 from contextlib import nullcontext
 import random
 torch.manual_seed(42)
@@ -60,72 +60,47 @@ else:
     device = "cpu"
 
 # ------------------------------------------------------------
-# 1.  Encoder loader (falls back to random weights offline)
+# 1.  CLIP Vision Encoder Loader (falls back to random weights offline)
 # ------------------------------------------------------------
 
-def get_enc_dim(enc):
-    # CLIP
-    if hasattr(enc.config, "vision_embed_dim"):
-        return enc.config.vision_embed_dim
-    if hasattr(enc.config, "vision_config"):
-        return enc.config.vision_config.hidden_size
-    # ViT or others
-    return enc.config.hidden_size
-
-def load_encoder(which: str = "clip"):
+def load_clip_encoder():
     """
-    Load a frozen vision encoder (CLIP or ViT).
-
-    Args:
-        which: "clip" or "vit".
-
+    Load a frozen CLIP vision encoder.
+    
     Returns:
-        vision_fwd: Callable that maps pixel tensor -> pooled features.
+        vision_fwd: Function that maps pixel tensor -> pooled features.
         hidden_dim: Output feature dimension of the encoder.
     """
-    if which == "clip":
-        try:
-            enc = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
-            enc.to(device).eval()
-            for p in enc.parameters():
-                p.requires_grad = False
-        except Exception:
-            print("⚠️  Offline – using random CLIP weights"); enc = CLIPModel(CLIPConfig()).to(device).eval()
-            for p in enc.parameters():
-                p.requires_grad = False
-        # we only keep the vision tower → pool to (B, D)
-        def vision_fwd(pix):
-            outputs = enc.get_image_features(pixel_values=pix)
-            return outputs
+    try:
+        enc = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
+        enc.to(device).eval()
+        for p in enc.parameters():
+            p.requires_grad = False
+    except Exception:
+        print("⚠️  Offline – using random CLIP weights")
+        enc = CLIPModel(CLIPConfig()).to(device).eval()
+        for p in enc.parameters():
+            p.requires_grad = False
+    
+    # Get the vision encoder's hidden dimension
+    if hasattr(enc.config, "vision_embed_dim"):
+        hidden_dim = enc.config.vision_embed_dim
+    elif hasattr(enc.config, "vision_config"):
+        hidden_dim = enc.config.vision_config.hidden_size
     else:
-        try:
-            enc = ViTModel.from_pretrained("google/vit-base-patch16-224-in21k")
-            enc.to(device).eval()
-            for p in enc.parameters():
-                p.requires_grad = False
-        except Exception:
-            print("⚠️  Offline – using random ViT weights"); enc = ViTModel(ViTConfig()).to(device).eval()
-            for p in enc.parameters():
-                p.requires_grad = False
-        def vision_fwd(pix):
-            outputs = enc(pixel_values=pix)
-            return outputs.pooler_output        # (B, D)
+        print("Warning: Unable to determine CLIP hidden size from config")
+        # Perform a forward pass to get the dimension
+        with torch.no_grad():
+            sample_out = enc.get_image_features(pixel_values=torch.randn(1, 3, 224, 224, device=device))
+            hidden_dim = sample_out.shape[-1]
     
-    # For safety, we'll verify the actual output dimension (outside the function definition)
-    with torch.no_grad():
-        sample_out = vision_fwd(torch.randn(1, 3, 224, 224, device=device))
-        actual_dim = sample_out.shape[-1]
-        print(f"Debug - Actual output dimension: {actual_dim}, Config dimension: {get_enc_dim(enc)}")
-        if which == "clip":
-            print(f"Debug - CLIP features shape: {sample_out.shape}")
-        else:
-            print(f"Debug - ViT features shape: {sample_out.shape}")
-        hidden = actual_dim
+    def vision_fwd(pixel_values):
+        return enc.get_image_features(pixel_values=pixel_values)
     
-    return vision_fwd, hidden
+    print(f"CLIP vision encoder dimension: {hidden_dim}")
+    return vision_fwd, hidden_dim
 
-vision, ENC_DIM = load_encoder("clip")   # swap to "vit" if you like
-print(f"Encoder hidden size = {ENC_DIM}")
+vision, ENC_DIM = load_clip_encoder()
 
 #%% [markdown]
 # ## Stage 2 – Load Flickr30k & Build a Caption DataLoader
@@ -329,11 +304,11 @@ def compute_bleu(model, vision_fn, dataloader, max_batches: int = 25):
 # to enlarge once the loop is stable.
 #%%
 
-SUBSET_TRAIN = "test[:5%]"     # First 5% for training
-SUBSET_VAL   = "test[5%:6%]"   # Next 1% for validation
-SUBSET_TEST  = "test[6%:7%]"   # Next 1% for testing
+SUBSET_TRAIN = "test[:5%]"     # First 20% for training
+SUBSET_VAL   = "test[5%:6%]"   # Next 2% for validation
+SUBSET_TEST  = "test[6%:7%]"   # Next 2% for testing
 
-NUM_EPOCHS  = 2
+NUM_EPOCHS  = 1
 BATCH_SIZE  = 4
 LR          = 3e-4
 
@@ -366,8 +341,18 @@ print("Tokenizer decode :", clip_tokenizer.decode(
 # We train for `NUM_EPOCHS` and log train / val loss each epoch.  
 # No fancy schedulers yet – keep the loop minimal.
 #%%
-model = TinyDecoder(enc_dim=ENC_DIM,
-                    dec_dim=512,
+with torch.no_grad():
+    sample_images = next(iter(train_loader))[0].to(device)
+    sample_features = vision(sample_images)
+    actual_dim = sample_features.shape[-1]
+    print(f"Verifying feature dimensions - config says: {ENC_DIM}, actual: {actual_dim}")
+    # Use the actual dimension for the decoder
+    enc_dim_to_use = actual_dim
+
+model = TinyDecoder(enc_dim=enc_dim_to_use,
+                    dec_dim=768,  # Increased from 512 to match recommendation
+                    n_layers=3,   # Increased from 1 for better capacity
+                    n_heads=12,   # Increased from 8 for better attention
                     vocab=len(clip_tokenizer)).to(device)
 
 loss_fn   = nn.CrossEntropyLoss(ignore_index=PAD_ID)
@@ -383,6 +368,8 @@ def run_epoch(loader, train: bool):
                                    targets.to(device))
         with torch.set_grad_enabled(train):
             img_feat = vision(images)
+            if steps == 0:
+                print(f"Image features shape: {img_feat.shape}, Expected: {ENC_DIM}")
             logits   = model(img_feat, dec_in)
             loss     = loss_fn(logits.view(-1, logits.size(-1)),
                                targets.view(-1))
@@ -401,7 +388,7 @@ for epoch in range(1, NUM_EPOCHS + 1):
     val_loss   = run_epoch(val_loader,   train=False)
     bleu_val = compute_bleu(model, vision, val_loader)
     print(f"Epoch {epoch}/{NUM_EPOCHS} | train {train_loss:.2f} | val {val_loss:.2f} | BLEU {bleu_val:.3f}")
-    if bleu_val > best_bleu:
+    if bleu_val >= best_bleu:
         best_bleu = bleu_val
         torch.save(model.state_dict(), "tiny_decoder_best.pt")
         print(f"✓ New best BLEU {best_bleu:.3f} – checkpoint saved.")
