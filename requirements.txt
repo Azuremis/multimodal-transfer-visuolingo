@@ -1,2 +1,8 @@
 torch
-transformers 
+transformers
+datasets
+torchvision
+pillow
+numpy 
+jupyter
+evaluate
