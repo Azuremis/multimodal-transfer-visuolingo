@@ -18,6 +18,7 @@ torch.manual_seed(42)
 random.seed(42)
 import numpy as np
 np.random.seed(42)
+import evaluate
 
 #%% [markdown]
 # ## Stage 1 – Tokenizer & Vocabulary (from CLIP)
@@ -224,6 +225,8 @@ class TinyDecoder(nn.Module):
         assert dec_dim % n_heads == 0, "n_heads must divide d_model"
         self.proj = (nn.Identity() if enc_dim == dec_dim else nn.Linear(enc_dim, dec_dim, bias=False))
         self.tok_emb = nn.Embedding(vocab, dec_dim)
+        # Initialise embeddings with a smaller std so early loss isn't gigantic
+        nn.init.normal_(self.tok_emb.weight, mean=0.0, std=0.02)
         self.pos_emb = nn.Parameter(torch.randn(1, max_len, dec_dim))
         dec_layer = nn.TransformerDecoderLayer(d_model=dec_dim, nhead=n_heads, batch_first=True)
         # Enable gradient checkpointing to save memory (PyTorch ≥ 2.3)
@@ -292,8 +295,30 @@ def greedy_generate(model: TinyDecoder,
             break
     return torch.tensor(generated, dtype=torch.long)
 
+# ------------------------------------------------------------
+# Utility – BLEU evaluator on a DataLoader
+# ------------------------------------------------------------
+bleu_metric = evaluate.load("bleu")
+
+@torch.no_grad()
+def compute_bleu(model, vision_fn, dataloader, max_batches: int = 25):
+    """
+    Compute corpus BLEU-4 on the dataloader (truncated to max_batches for speed).
+    """
+    model.eval()
+    preds, refs = [], []
+    for b, (imgs, _, labels) in enumerate(dataloader):
+        if b >= max_batches: break
+        imgs = imgs.to(device)
+        ids  = greedy_generate(model, vision_fn, imgs[0])
+        preds.append(clip_tokenizer.decode(ids.tolist(), skip_special_tokens=True))
+        ref_txt = clip_tokenizer.decode(labels[0].tolist(), skip_special_tokens=True)
+        refs.append([ref_txt])
+    score = bleu_metric.compute(predictions=preds, references=refs)["bleu"]
+    return score
+
 #%% [markdown]
-# ## Stage 3 – Mini Train / Validation / Test Splits
+# ## Stage 3 – Mini Train / Validation / Test Splits
 #
 # To keep development light on an M‑series laptop, we sample tiny subsets:
 # * **Train**  5 % of Flickr30k train split  
@@ -336,7 +361,7 @@ print("Tokenizer decode :", clip_tokenizer.decode(
          dec_inputs_batch[0].tolist(), skip_special_tokens=True))
 
 #%% [markdown]
-# ## Stage 4 – Tiny Training Loop
+# ## Stage 4 – Tiny Training Loop
 #
 # We train for `NUM_EPOCHS` and log train / val loss each epoch.  
 # No fancy schedulers yet – keep the loop minimal.
@@ -369,16 +394,20 @@ def run_epoch(loader, train: bool):
         steps += 1
     return running_loss / steps
 
+best_bleu = 0.0
+
 for epoch in range(1, NUM_EPOCHS + 1):
     train_loss = run_epoch(train_loader, train=True)
     val_loss   = run_epoch(val_loader,   train=False)
-    print(f"Epoch {epoch}/{NUM_EPOCHS} | train loss {train_loss:.2f} | val loss {val_loss:.2f}")
-
-# save final tiny model
-torch.save(model.state_dict(), "tiny_decoder_v2.pt")
+    bleu_val = compute_bleu(model, vision, val_loader)
+    print(f"Epoch {epoch}/{NUM_EPOCHS} | train {train_loss:.2f} | val {val_loss:.2f} | BLEU {bleu_val:.3f}")
+    if bleu_val > best_bleu:
+        best_bleu = bleu_val
+        torch.save(model.state_dict(), "tiny_decoder_best.pt")
+        print(f"✓ New best BLEU {best_bleu:.3f} – checkpoint saved.")
 
 #%% [markdown]
-# ## Stage 5 – Quick Test‑set Inference
+# ## Stage 5 – Quick Test‑set Inference
 #%%
 model.eval()
 images_test, _, _ = next(iter(test_loader))
