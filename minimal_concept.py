@@ -293,45 +293,86 @@ def greedy_generate(model: TinyDecoder,
     return torch.tensor(generated, dtype=torch.long)
 
 #%% [markdown]
-# ## Stage 3 – Single Training Step Demo
+# ## Stage 3 – Mini Train / Validation / Test Splits
 #
-# We run one forward/backward pass to prove the whole pipeline works.
-# This is **not** a full training loop; replace it with epoch logic later.
+# To keep development light on an M‑series laptop, we sample tiny subsets:
+# * **Train**  5 % of Flickr30k train split  
+# * **Val**   1 % of Flickr30k validation split  
+# * **Test**   1 % of Flickr30k test split  
+#
+# Use `NUM_EPOCHS = 2` and `BATCH_SIZE = 4` for a quick sanity‑run. Feel free
+# to enlarge once the loop is stable.
+#%%
+
+SUBSET_TRAIN = "test[:5%]"     # First 5% for training
+SUBSET_VAL   = "test[5%:6%]"   # Next 1% for validation
+SUBSET_TEST  = "test[6%:7%]"   # Next 1% for testing
+
+NUM_EPOCHS  = 2
+BATCH_SIZE  = 4
+LR          = 3e-4
+
+train_set = load_dataset("nlphuji/flickr30k", split=SUBSET_TRAIN)
+val_set   = load_dataset("nlphuji/flickr30k", split=SUBSET_VAL)
+test_set  = load_dataset("nlphuji/flickr30k", split=SUBSET_TEST)
+
+train_loader = DataLoader(train_set, batch_size=BATCH_SIZE,
+                          shuffle=True,  collate_fn=collate_caption)
+val_loader   = DataLoader(val_set,   batch_size=BATCH_SIZE,
+                          shuffle=False, collate_fn=collate_caption)
+test_loader  = DataLoader(test_set,  batch_size=BATCH_SIZE,
+                          shuffle=False, collate_fn=collate_caption)
+
+print(f"Train {len(train_set)} | Val {len(val_set)} | Test {len(test_set)}")
+
+#%% [markdown]
+# ## Stage 4 – Tiny Training Loop
+#
+# We train for `NUM_EPOCHS` and log train / val loss each epoch.  
+# No fancy schedulers yet – keep the loop minimal.
 #%%
 model = TinyDecoder(enc_dim=ENC_DIM,
                     dec_dim=512,
-                    vocab=len(clip_tokenizer)).to(device).eval()
+                    vocab=len(clip_tokenizer)).to(device)
 
-loss_fn = nn.CrossEntropyLoss(ignore_index=PAD_ID)
+loss_fn   = nn.CrossEntropyLoss(ignore_index=PAD_ID)
+optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
 
-model.train()
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+def run_epoch(loader, train: bool):
+    running_loss = 0.0
+    steps = 0
+    model.train(mode=train)
+    for images, dec_in, targets in loader:
+        images, dec_in, targets = (images.to(device),
+                                   dec_in.to(device),
+                                   targets.to(device))
+        with torch.set_grad_enabled(train):
+            img_feat = vision(images)
+            logits   = model(img_feat, dec_in)
+            loss     = loss_fn(logits.view(-1, logits.size(-1)),
+                               targets.view(-1))
+            if train:
+                loss.backward()
+                optimizer.step()
+                optimizer.zero_grad()
+        running_loss += loss.item()
+        steps += 1
+    return running_loss / steps
 
-images_batch = images_batch.to(device)
-dec_inputs_batch = dec_inputs_batch.to(device)
-targets_batch = targets_batch.to(device)
+for epoch in range(1, NUM_EPOCHS + 1):
+    train_loss = run_epoch(train_loader, train=True)
+    val_loss   = run_epoch(val_loader,   train=False)
+    print(f"Epoch {epoch}/{NUM_EPOCHS} | train loss {train_loss:.2f} | val loss {val_loss:.2f}")
 
-encoder_features = vision(images_batch)
-logits_train = model(encoder_features, dec_inputs_batch)
+# save final tiny model
+torch.save(model.state_dict(), "tiny_decoder_v2.pt")
 
-flat_logits   = logits_train.view(-1, logits_train.size(-1))
-flat_targets  = targets_batch.view(-1)
-
-train_loss = loss_fn(flat_logits, flat_targets)
-train_loss.backward()
-optimizer.step()
-optimizer.zero_grad()
-
-print("One-step training loss:", float(train_loss))
+#%% [markdown]
+# ## Stage 5 – Quick Test‑set Inference
+#%%
 model.eval()
-
-# ---- checkpoint demo ----
-torch.save(model.state_dict(), "tiny_decoder.pt")
-model.load_state_dict(torch.load("tiny_decoder.pt"))
-print("✅  Forward pass OK – logits shape:", logits_train.shape, "(checkpoint round‑trip verified)")
-
-# Greedy caption demo
-generated_ids = greedy_generate(model, vision, images_batch[0])
-caption_text  = clip_tokenizer.decode(generated_ids.tolist(),
-                                      skip_special_tokens=True)
-print("Greedy caption:", caption_text)
+images_test, _, _ = next(iter(test_loader))
+sample_caption_ids = greedy_generate(model, vision, images_test[0])
+print("Generated IDs:", sample_caption_ids.tolist())
+print("→", clip_tokenizer.decode(sample_caption_ids.tolist(),
+                                 skip_special_tokens=True))
