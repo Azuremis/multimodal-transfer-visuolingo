@@ -120,11 +120,12 @@ def collate_caption(batch):
         # Use first caption; clip_tokenizer handles truncation
         caption_tokens = clip_tokenizer(
             item["caption"][0],
+            add_special_tokens=False,   # <- no BOS/EOS from tokenizer
             truncation=True,
             max_length=64
         ).input_ids
 
-        # Build BOS + caption  / target = caption + EOS
+        # Build BOS + caption   | target = caption + EOS  (no duplicates)
         decoder_in  = [BOS_ID] + caption_tokens
         target_out  = caption_tokens + [EOS_ID]
 
@@ -181,8 +182,9 @@ class TinyDecoder(nn.Module):
         self.tok_emb = nn.Embedding(vocab, dec_dim)
         with torch.no_grad():
             self.tok_emb.weight[: clip_text_emb.size(0)].copy_(clip_text_emb)
+            self.tok_emb.weight[PAD_ID].zero_()          # neutralise PAD vector
         for p in self.tok_emb.parameters():
-            p.requires_grad = False
+            p.requires_grad = False                      # keep everything frozen
         self.pos_emb = nn.Parameter(torch.randn(1, max_len, dec_dim))
         dec_layer = nn.TransformerDecoderLayer(d_model=dec_dim, nhead=n_heads, batch_first=True)
         if hasattr(dec_layer, "_set_gradient_checkpointing"):
@@ -238,23 +240,38 @@ def greedy_generate(model: TinyDecoder,
     Run naive greedy decoding given a single image tensor on `device`.
     Returns a 1‑D tensor of generated token IDs (including EOS).
     """
+    print(f"[GENERATE] Starting greedy generation (max_len={max_len})")
     patch_seq = vision_fn(image.to(device).unsqueeze(0))
+    print(f"[GENERATE] Extracted patch sequence: {patch_seq.shape}")
+    
     generated = [bos_token]
+    print(f"[GENERATE] Starting with BOS token: {bos_token}")
+    
     for step in range(max_len):
         inp = torch.tensor(generated, device=patch_seq.device).unsqueeze(0)
         logits = model(patch_seq, inp)
+        print(f"[GENERATE] Step {step+1}: logits shape {logits.shape}")
         
-        # Print top token probabilities for debugging
-        if print_probs and step == 0:  # Print for first step
-            probs = logits.softmax(-1)[0, -1]
-            values, indices = probs.topk(5)
-            top5_tokens = [clip_tokenizer.decode([idx.item()]) for idx in indices]
-            print("Top 5 first tokens:", list(zip(top5_tokens, values.tolist())))
+        next_token_logits = logits[0, -1]
+        # Print top token probabilities for monitoring
+        probs = next_token_logits.softmax(-1)
+        values, indices = probs.topk(5)
+        top5_tokens = [clip_tokenizer.decode([idx.item()]) for idx in indices]
+        if print_probs or step < 3:  # Print for first few steps regardless
+            print(f"[GENERATE] Top 5 tokens for step {step+1}: {list(zip(top5_tokens, values.tolist()))}")
         
-        next_id = int(logits[0, -1].argmax())
+        next_id = int(next_token_logits.argmax())
+        token_text = clip_tokenizer.decode([next_id])
+        print(f"[GENERATE] Selected token: '{token_text}' (ID: {next_id})")
+        
         generated.append(next_id)
         if next_id == eos_token:
+            print(f"[GENERATE] EOS token generated, stopping at length {len(generated)}")
             break
+    
+    # Show final sequence
+    full_text = clip_tokenizer.decode(generated, skip_special_tokens=True)
+    print(f"[GENERATE] Final text: '{full_text}'")
     return torch.tensor(generated, dtype=torch.long)
 
 # ------------------------------------------------------------
@@ -270,30 +287,28 @@ def compute_bleu(model, vision_fn, dataloader, max_batches: int = 25):
     """
     model.eval()
     preds, refs = [], []
+    print(f"[BLEU] Starting evaluation on {min(max_batches, len(dataloader))} batches")
     for b, (imgs, _, labels) in enumerate(dataloader):
         if b >= max_batches: break
         imgs = imgs.to(device)
+        print(f"[BLEU] Batch {b+1}, processing {imgs.size(0)} images")
         # Process all images in the batch, not just the first one
         for i in range(imgs.size(0)):
+            print(f"  [BLEU] Image {i+1}/{imgs.size(0)}")
             ids = greedy_generate(model, vision_fn, imgs[i])
             decoded_text = clip_tokenizer.decode(ids.tolist(), skip_special_tokens=True)
-            # Ensure we don't add empty predictions
-            if not decoded_text.strip():
-                decoded_text = "empty"  # Add fallback text to prevent division by zero
+            print(f"  [BLEU] Generated: '{decoded_text}'")
             preds.append(decoded_text)
             ref_txt = clip_tokenizer.decode(labels[i].tolist(), skip_special_tokens=True)
+            print(f"  [BLEU] Reference: '{ref_txt}'")
             refs.append([ref_txt])
     
-    # Check if we have any non-empty predictions
-    if not preds or all(p == "empty" for p in preds):
-        print("Warning: All predictions are empty! BLEU would be 0.")
-        return 0.0
-        
+    print(f"[BLEU] Computing score with {len(preds)} predictions")
     try:
         score = bleu_metric.compute(predictions=preds, references=refs)["bleu"]
         return score
     except Exception as e:
-        print(f"BLEU calculation error: {e}")
+        print(f"[BLEU] Calculation error: {e}")
         return 0.0
 
 #%% [markdown]
@@ -312,7 +327,7 @@ SUBSET_TRAIN = "test[:20%]"   # Increase to 20% for better training
 SUBSET_VAL   = "test[20%:22%]" # Move validation set accordingly
 SUBSET_TEST  = "test[22%:24%]" # Move test set accordingly
 
-NUM_EPOCHS = 10  # Increase from 3 to 10
+NUM_EPOCHS = 2  # Increase from 3 to 10
 BATCH_SIZE  = 4
 LR          = 1e-4
 
@@ -358,28 +373,79 @@ def run_epoch(loader, train: bool):
     running_loss = 0.0
     steps = 0
     model.train(mode=train)
+    print(f"[EPOCH] Starting {'training' if train else 'validation'} with {len(loader)} batches")
+    
     for images, dec_in, targets in loader:
         images, dec_in, targets = (images.to(device),
-                                   dec_in.to(device),
-                                   targets.to(device))
-        patch_seq = get_patch_sequence(images)                 # (B,P,512)
+                                 dec_in.to(device),
+                                 targets.to(device))
+        print(f"[EPOCH] Batch {steps+1}: images {images.shape}, dec_in {dec_in.shape}, targets {targets.shape}")
+        
+        patch_seq = get_patch_sequence(images)
+        print(f"[EPOCH] Patch sequence shape: {patch_seq.shape}")
+        
         with torch.set_grad_enabled(train):
-            if steps == 0:
-                print(f"Patch seq shape: {patch_seq.shape}")
-            logits   = model(patch_seq, dec_in)
+            logits = model(patch_seq, dec_in)
+            print(f"[EPOCH] Model output logits shape: {logits.shape}")
 
+            # ------------------------------------------------------------
+            # Build labels:                         patch prefix  | caption
+            # labels_full shape  (B, P + L)
+            #   * -100 for every patch position
+            #   * -100 for PAD tokens
+            #   * target token t  sits at  BOS+t   (shift-right)
+            # ------------------------------------------------------------
             B, P, _ = patch_seq.shape
-            labels_full = torch.full((B, P + dec_in.size(1)),
-                                     -100, device=device)
-            labels_full[:, P:] = targets
-            loss     = loss_fn(logits.view(-1, logits.size(-1)),
-                               labels_full.view(-1))
+            L = dec_in.size(1)                       # caption length incl. BOS
+            print(f"[EPOCH] Dimensions: B={B}, P={P}, L={L}")
+            
+            # Build full labels tensor with P (patches) + L (text tokens) 
+            labels_full = torch.full((B, P + L), -100, device=device)
+
+            # Shift target tokens by +1 (so first token is predicted after BOS)
+            max_tgt_len = min(L-1, targets.size(1))  # Ensure we don't exceed label tensor size
+            non_pad = (targets[:, :max_tgt_len] != PAD_ID)
+            labels_full[:, P+1:P+1+max_tgt_len][non_pad] = targets[:, :max_tgt_len][non_pad]
+            
+            # optional sanity print on first batch
+            if steps == 0:
+                print("[EPOCH] Label check (patch-1…BOS…w1):",
+                    labels_full[0, P-1:P+4].tolist())
+                # Print some actual token values
+                for i in range(min(3, B)):
+                    # print(f"[EPOCH] Input sample {i+1}:")
+                    dec_text = clip_tokenizer.decode(dec_in[i].tolist(), skip_special_tokens=False)
+                    target_text = clip_tokenizer.decode(targets[i].tolist(), skip_special_tokens=False)
+                    # print(f"  Input IDs: {dec_in[i, :min(10, L)].tolist()}")
+                    # print(f"  Target IDs: {targets[i, :min(10, L)].tolist()}")
+                    # print(f"  Input text: '{dec_text}'")
+                    # print(f"  Target text: '{target_text}'")
+            
+            # Check shapes before loss computation
+            print(f"[EPOCH] Logits shape for loss: {logits.reshape(-1, logits.size(-1)).shape}")
+            print(f"[EPOCH] Labels shape for loss: {labels_full.view(-1).shape}")
+            
+            try:
+                loss = loss_fn(logits.reshape(-1, logits.size(-1)),
+                             labels_full.view(-1))
+                print(f"[EPOCH] Computed loss: {loss.item():.4f}")
+            except Exception as e:
+                print(f"[EPOCH] ERROR computing loss: {e}")
+                raise e
+            
             if train:
                 loss.backward()
                 optimizer.step()
                 optimizer.zero_grad()
+                print(f"[EPOCH] Performed backward pass and optimization step")
+                
         running_loss += loss.item()
         steps += 1
+        
+        # Only log detailed info for first few batches
+        if steps >= 3:
+            print(f"[EPOCH] Batch {steps} completed, loss: {loss.item():.4f}")
+        
     return running_loss / steps
 
 best_bleu = 0.0
@@ -403,3 +469,19 @@ images_test, _, _ = next(iter(test_loader))
 sample_caption_ids = greedy_generate(model, get_patch_sequence, images_test[0], print_probs=True)
 print("Generated IDs:", sample_caption_ids.tolist())
 print("→", clip_tokenizer.decode(sample_caption_ids.tolist(), skip_special_tokens=True))
+
+# Add final test logging to the very end of the file
+# Add this at the end of the file
+print("\n[TEST] ===== Final test inference with trained model =====")
+model.eval()
+images_test, dec_in_test, target_test = next(iter(test_loader))
+print(f"[TEST] Test batch shapes: images {images_test.shape}, dec_in {dec_in_test.shape}")
+
+# Show test image ground truth
+print(f"[TEST] Ground truth caption: '{clip_tokenizer.decode(target_test[0].tolist(), skip_special_tokens=True)}'")
+
+# Run generation with detailed logging
+print("[TEST] Running greedy generation...")
+sample_caption_ids = greedy_generate(model, get_patch_sequence, images_test[0], print_probs=True)
+print("[TEST] Generated IDs:", sample_caption_ids.tolist())
+print("[TEST] →", clip_tokenizer.decode(sample_caption_ids.tolist(), skip_special_tokens=True))
