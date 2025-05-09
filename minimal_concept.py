@@ -191,8 +191,6 @@ class TinyDecoder(nn.Module):
         with torch.no_grad():
             self.tok_emb.weight[: clip_text_emb.size(0)].copy_(clip_text_emb)
             self.tok_emb.weight[PAD_ID].zero_()  # neutralise PAD vector
-        for p in self.tok_emb.parameters():
-            p.requires_grad = False              # keep embeddings frozen
             
         # Position embeddings - separate for memory and target
         self.mem_pos_emb = nn.Parameter(torch.randn(1, max_len, dec_dim))  # for patches 
@@ -359,13 +357,14 @@ def compute_bleu(model, vision_fn, dataloader, max_batches: int = 25):
 # to enlarge once the loop is stable.
 #%%
 
-SUBSET_TRAIN = "test[:20%]"   # Increase to 20% for better training
-SUBSET_VAL   = "test[20%:22%]" # Move validation set accordingly
-SUBSET_TEST  = "test[22%:24%]" # Move test set accordingly
-
-NUM_EPOCHS = 2  # Increase from 3 to 10
+NUM_EPOCHS = 6            # more epochs
 BATCH_SIZE  = 4
-LR          = 1e-4
+LR_MAIN     = 1e-4        # lr for decoder & proj
+LR_EMB      = 5e-5        # lower lr for large token table
+
+SUBSET_TRAIN = "test[:60%]"
+SUBSET_VAL   = "test[60%:65%]"
+SUBSET_TEST  = "test[65%:70%]"
 
 train_set = load_dataset("nlphuji/flickr30k", split=SUBSET_TRAIN)
 val_set   = load_dataset("nlphuji/flickr30k", split=SUBSET_VAL)
@@ -405,7 +404,13 @@ model = TinyDecoder(
 ).to(device)
 
 loss_fn = nn.CrossEntropyLoss(ignore_index=-100)  # Ignore padding
-optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
+optimizer = torch.optim.AdamW(
+    [
+        dict(params=model.tok_emb.parameters(),            lr=LR_EMB),
+        dict(params=[p for n,p in model.named_parameters()
+                     if "tok_emb" not in n],               lr=LR_MAIN)
+    ]
+)
 
 def run_epoch(loader, train: bool):
     running_loss = 0.0
@@ -417,51 +422,44 @@ def run_epoch(loader, train: bool):
         images, dec_in, targets = (images.to(device),
                                  dec_in.to(device),
                                  targets.to(device))
-        print(f"[EPOCH] Batch {steps+1}: images {images.shape}, dec_in {dec_in.shape}, targets {targets.shape}")
-        
+        if steps == 0:
+            print(f"[EPOCH] Batch 1 shapes – images {images.shape}, dec_in {dec_in.shape}")
+
         # Get patches from vision encoder
         patch_seq = get_patch_sequence(images)
-        print(f"[EPOCH] Patch sequence shape: {patch_seq.shape}")
-        
+
         with torch.set_grad_enabled(train):
             # Get predictions - using standard encoder-decoder architecture
             logits = model(patch_seq, dec_in)  # (B, L, vocab)
-            print(f"[EPOCH] Model output logits shape: {logits.shape}")
 
             # Create target tensor for loss calculation 
             # We need to predict the next token at each position
             shifted_targets = targets.clone()
             shifted_targets[shifted_targets == PAD_ID] = -100  # Ignore padding tokens
-            
+
             # Print debug info
             if steps == 0:
                 print(f"[EPOCH] Input IDs shape: {dec_in.shape}, Target IDs shape: {shifted_targets.shape}")
                 print(f"[EPOCH] First sample input: {dec_in[0, :5].tolist()}")
                 print(f"[EPOCH] First sample target: {shifted_targets[0, :5].tolist()}")
-            
+
             # Compute loss directly on sequence - no need for complex shifting
             try:
                 loss = loss_fn(
                     logits.reshape(-1, logits.size(-1)),  # (B*L, vocab)
                     shifted_targets.reshape(-1)           # (B*L)
                 )
-                print(f"[EPOCH] Computed loss: {loss.item():.4f}")
             except Exception as e:
                 print(f"[EPOCH] ERROR computing loss: {e}")
                 raise e
-            
+
             if train:
                 loss.backward()
                 optimizer.step()
                 optimizer.zero_grad()
-                print(f"[EPOCH] Performed backward pass and optimization step")
-                
+
         running_loss += loss.item()
         steps += 1
-        
-        # Only log detailed info for first few batches
-        if steps >= 3:
-            print(f"[EPOCH] Batch {steps} completed, loss: {loss.item():.4f}")
         
     return running_loss / steps
 
